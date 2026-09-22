@@ -1,9 +1,12 @@
 import mongoose from 'mongoose';
 import { logger } from '@librechat/data-schemas';
 import { MongoMemoryServer } from 'mongodb-memory-server';
+import { FakeChatModel, Providers, Run } from '@librechat/agents';
 import { HumanMessage } from '@librechat/agents/langchain/messages';
+import { tool } from '@librechat/agents/langchain/tools';
 import { MongoDBSaver } from '@langchain/langgraph-checkpoint-mongodb';
 import { emptyCheckpoint, ERROR, INTERRUPT } from '@langchain/langgraph-checkpoint';
+import { z } from 'zod';
 import {
   getAgentCheckpointer,
   hasDurableAgentInterruptCheckpoint,
@@ -939,6 +942,218 @@ describe('LazyMongoSaver (lazy persistence — mongodb-memory-server)', () => {
     const out = await build().invoke(new Command({ resume: 'YES' }), cfg);
     expect(out.results).toEqual(['b:YES']);
     expect(effects).toEqual({ a: 1, c: 1 }); // siblings did NOT re-execute
+  });
+
+  it('end-to-end: a rebuilt SubagentExecutor resumes a child checkpoint without re-executing researcher', async () => {
+    // Regression boundary for the historical BOT MODE incident. This uses the SDK's real
+    // StandardGraph -> ToolNode -> SubagentExecutor path, a real durable saver, and a fresh
+    // Run on resume. FakeChatModel only supplies deterministic tool calls; no provider is used.
+    const saver = await getAgentCheckpointer(MONGO_CFG);
+    if (saver == null) {
+      throw new Error('Expected the Mongo-backed saver');
+    }
+
+    const researchEffects: string[] = [];
+    const writerEffects: string[] = [];
+    const approvalEffects: string[] = [];
+    const researcher = tool(
+      async () => {
+        researchEffects.push('research');
+        return 'research complete';
+      },
+      { name: 'researcher', description: 'Deterministic research', schema: z.object({}) },
+    );
+    const writer = tool(
+      async () => {
+        writerEffects.push('writer');
+        return 'writer complete';
+      },
+      { name: 'writer', description: 'Deterministic writing', schema: z.object({}) },
+    );
+    const approval = tool(
+      async () => {
+        const { interrupt } = await import('@langchain/langgraph');
+        const decision = interrupt<string, string>('approve child output?');
+        approvalEffects.push(decision);
+        return `approved:${decision}`;
+      },
+      { name: 'approval', description: 'Pause the child deterministically', schema: z.object({}) },
+    );
+
+    type ToolCallStage = { id: string; name: string; args: Record<string, unknown> };
+    const stagedModel = (stages: ToolCallStage[]) => {
+      let index = 0;
+      const next = () => {
+        const call = stages[index++];
+        return new FakeChatModel({
+          responses: [''],
+          toolCalls: call == null ? [] : [call as never],
+        });
+      };
+      // StandardGraph uses stream() in the normal path. invoke() makes this a complete
+      // ChatModel-shaped deterministic double if the SDK selects its non-stream fallback.
+      return {
+        stream: async (...args: never[]) =>
+          (next().stream as (...params: never[]) => Promise<unknown>)(...args),
+        invoke: async (...args: never[]) =>
+          (next().invoke as (...params: never[]) => Promise<unknown>)(...args),
+      } as never;
+    };
+
+    const makeRun = async (runId: string, parentModel: unknown, childModel: unknown) => {
+      const run = await Run.create({
+        runId,
+        humanInTheLoop: { enabled: true },
+        graphConfig: {
+          type: 'standard',
+          compileOptions: { checkpointer: saver as never },
+          agents: [
+            {
+              agentId: 'parent',
+              provider: Providers.OPENAI,
+              instructions: 'Delegate exactly once.',
+              subagentConfigs: [
+                {
+                  type: 'researcher',
+                  name: 'researcher',
+                  description: 'Research then write before asking approval.',
+                  agentInputs: {
+                    agentId: 'child',
+                    provider: Providers.OPENAI,
+                    instructions: 'Use researcher, then writer, then approval.',
+                    graphTools: [researcher, writer, approval],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      });
+      const graph = run.Graph;
+      if (graph == null) {
+        throw new Error('Expected Run to create its parent graph');
+      }
+      // Run creates its initial workflow before test models are injected. Recompile the same
+      // production graph after injection so its real child factory captures the child model.
+      graph.overrideModel = parentModel as never;
+      graph.setSubagentModelOverride(childModel as never);
+      run.graphRunnable = graph.createWorkflow();
+      return run;
+    };
+
+    const parentThreadId = `parent-${new mongoose.Types.ObjectId().toString()}`;
+    const streamConfig = {
+      version: 'v2' as const,
+      durability: 'exit' as const,
+      configurable: { thread_id: parentThreadId },
+    };
+    const firstRun = await makeRun(
+      'parent-first',
+      stagedModel([
+        {
+          id: 'parent-subagent-call',
+          name: 'subagent',
+          args: { description: 'Research this request.', subagent_type: 'researcher' },
+        },
+      ]),
+      stagedModel([
+        { id: 'child-research-call', name: 'researcher', args: {} },
+        { id: 'child-writer-call', name: 'writer', args: {} },
+        { id: 'child-approval-call', name: 'approval', args: {} },
+      ]),
+    );
+
+    await firstRun.processStream({ messages: [new HumanMessage('Start research.')] }, streamConfig);
+    expect(researchEffects).toEqual(['research']);
+    expect(writerEffects).toEqual(['writer']);
+    expect(approvalEffects).toEqual([]);
+
+    const childThreadIds = firstRun.getChildCheckpointThreadIds();
+    expect(childThreadIds).toHaveLength(1);
+    const childThreadId = childThreadIds[0];
+
+    // Read the persisted PARENT interrupt, not an in-memory executor field: this is the actual
+    // ToolNode/SubagentExecutor payload that the rebuilt Run will restore and re-inject.
+    const parentGraph = firstRun.graphRunnable as typeof firstRun.graphRunnable & {
+      getState(config: { configurable: { thread_id: string } }): Promise<{
+        tasks: Array<{ interrupts: Array<{ value: unknown }> }>;
+      }>;
+    };
+    const parentSnapshot = await parentGraph.getState({
+      configurable: { thread_id: parentThreadId },
+    });
+    const parentInterrupt = parentSnapshot.tasks.flatMap((task) => task.interrupts)[0];
+    expect(parentInterrupt).toBeDefined();
+    const parentInterruptValue = parentInterrupt!.value as {
+      __librechat_run_step_resume_payload?: unknown;
+    };
+    const manifestPayload =
+      parentInterruptValue.__librechat_run_step_resume_payload ?? parentInterrupt!.value;
+    const manifest = (
+      manifestPayload as {
+        __librechat_subagent_resume_manifest?: {
+          executions: Array<{
+            parentToolCallId: string;
+            checkpoints: Array<{ threadId: string; checkpointNs: string; checkpointId: string }>;
+          }>;
+        };
+      }
+    ).__librechat_subagent_resume_manifest;
+    expect(manifest?.executions).toHaveLength(1);
+    expect(manifest?.executions[0].parentToolCallId).toBe('parent-subagent-call');
+    const checkpointReference = manifest?.executions[0].checkpoints.find(
+      (checkpoint) => checkpoint.threadId === childThreadId,
+    );
+    if (checkpointReference == null) {
+      throw new Error('Expected an exact child checkpoint reference in the durable manifest');
+    }
+    expect(typeof checkpointReference.checkpointNs).toBe('string');
+    expect(checkpointReference.checkpointId).toEqual(expect.any(String));
+    expect(checkpointReference.checkpointId).not.toBe('');
+    const childConfig = {
+      configurable: {
+        thread_id: checkpointReference.threadId,
+        checkpoint_ns: checkpointReference.checkpointNs,
+        checkpoint_id: checkpointReference.checkpointId,
+      },
+    };
+    const childCheckpoint = await saver.getTuple(childConfig);
+    expect(childCheckpoint?.config.configurable).toEqual(childConfig.configurable);
+    expect(childCheckpoint?.checkpoint.id).toBe(checkpointReference.checkpointId);
+    expect(childCheckpoint?.pendingWrites).toEqual(
+      expect.arrayContaining([
+        [
+          expect.any(String),
+          INTERRUPT,
+          expect.objectContaining({
+            value: expect.objectContaining({
+              __librechat_run_step_resume_payload: 'approve child output?',
+            }),
+          }),
+        ],
+      ]),
+    );
+
+    // A new Run and newly compiled parent/child graphs mirror process-boundary reconstruction.
+    // Run.resume() restores the persisted parent interrupt, extracts the real manifest above,
+    // and puts it back into the rebuilt executor's config before LangGraph resumes the child.
+    const rebuiltRun = await makeRun(
+      'parent-rebuilt',
+      new FakeChatModel({ responses: ['parent complete'] }),
+      new FakeChatModel({ responses: ['child complete'] }),
+    );
+    const readback = jest.spyOn(saver, 'getTuple');
+    await rebuiltRun.resume('YES', streamConfig);
+    expect(readback).toHaveBeenCalledWith(
+      expect.objectContaining({
+        configurable: expect.objectContaining(childConfig.configurable),
+      }),
+    );
+    readback.mockRestore();
+
+    expect(researchEffects).toEqual(['research']);
+    expect(writerEffects).toEqual(['writer']);
+    expect(approvalEffects).toEqual(['YES']);
   });
 });
 

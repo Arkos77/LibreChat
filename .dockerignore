@@ -10,6 +10,8 @@
 data-node
 meili_data*
 librechat*
+!vendor/librechat-agents/
+!vendor/librechat-agents/**
 Dockerfile*
 docs
 
