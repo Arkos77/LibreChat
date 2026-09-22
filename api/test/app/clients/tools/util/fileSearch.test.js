@@ -3,6 +3,7 @@ const { ResourceType } = require('librechat-data-provider');
 
 jest.mock('axios');
 jest.mock('@librechat/api', () => ({
+  collectFileSearchResults: jest.requireActual('@librechat/api').collectFileSearchResults,
   generateShortLivedToken: jest.fn(),
   logAxiosError: jest.fn(),
 }));
@@ -314,5 +315,64 @@ describe('entity_id scoping by file origin', () => {
     });
     await tool.func({ query: 'q' });
     expect(bodiesSent()[0].entity_id).toBeUndefined();
+  });
+});
+
+describe('P7 retrieval provenance', () => {
+  beforeEach(() => {
+    generateShortLivedToken.mockReturnValue('test-token');
+    axios.post.mockReset();
+  });
+
+  it('keeps the successful file identity after an earlier request fails', async () => {
+    axios.post.mockRejectedValueOnce(new Error('unavailable')).mockResolvedValueOnce({
+      data: [
+        [
+          { id: 'chunk-b', page_content: 'Evidence', metadata: { source: 'b.txt', file_id: 'b' } },
+          0.2,
+        ],
+      ],
+    });
+    const search = await createFileSearchTool({
+      userId: 'test',
+      files: [
+        { file_id: 'a', filename: 'a.txt' },
+        { file_id: 'b', filename: 'b.txt' },
+      ],
+    });
+    const [, artifact] = await search.func({ query: 'evidence' });
+    expect(artifact.file_search.sources[0]).toMatchObject({
+      fileId: 'b',
+      documentId: 'b',
+      chunkId: 'chunk-b',
+      distance: 0.2,
+    });
+  });
+
+  it('does not present a result without source metadata as sourced', async () => {
+    axios.post.mockResolvedValueOnce({
+      data: [[{ page_content: 'Unattributed', metadata: {} }, 0.1]],
+    });
+    const search = await createFileSearchTool({
+      userId: 'test',
+      files: [{ file_id: 'a', filename: 'a.txt' }],
+    });
+    const [content, artifact] = await search.func({ query: 'evidence' });
+    expect(artifact).toBeUndefined();
+    expect(content).not.toContain('Unattributed');
+  });
+
+  it('honors an explicit cosine-distance cutoff without treating it as truth confidence', async () => {
+    axios.post.mockResolvedValueOnce({
+      data: [[{ page_content: 'Unrelated', metadata: { source: 'a.txt' } }, 0.95]],
+    });
+    const search = await createFileSearchTool({
+      userId: 'test',
+      files: [{ file_id: 'a', filename: 'a.txt' }],
+      maxDistance: 0.5,
+    });
+    const [content, artifact] = await search.func({ query: 'different subject' });
+    expect(artifact).toBeUndefined();
+    expect(content).not.toContain('Unrelated');
   });
 });

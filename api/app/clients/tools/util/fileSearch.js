@@ -1,7 +1,11 @@
 const axios = require('axios');
 const { logger } = require('@librechat/data-schemas');
 const { tool } = require('@librechat/agents/langchain/tools');
-const { generateShortLivedToken, logAxiosError } = require('@librechat/api');
+const {
+  generateShortLivedToken,
+  logAxiosError,
+  collectFileSearchResults,
+} = require('@librechat/api');
 const { Tools, EToolResources } = require('librechat-data-provider');
 const { filterFilesByAgentAccess } = require('~/server/services/Files/permissions');
 const { getFiles } = require('~/models');
@@ -85,10 +89,17 @@ const primeFiles = async (options) => {
  * @param {string} options.userId
  * @param {Array<{ file_id: string; filename: string; fromAgent?: boolean }>} options.files
  * @param {string} [options.entity_id]
+ * @param {number} [options.maxDistance] - Optional cosine-distance cutoff (pgvector only).
  * @param {boolean} [options.fileCitations=false] - Whether to include citation instructions
  * @returns
  */
-const createFileSearchTool = async ({ userId, files, entity_id, fileCitations = false }) => {
+const createFileSearchTool = async ({
+  userId,
+  files,
+  entity_id,
+  fileCitations = false,
+  maxDistance,
+}) => {
   return tool(
     async ({ query }) => {
       if (files.length === 0) {
@@ -132,6 +143,7 @@ const createFileSearchTool = async ({ userId, files, entity_id, fileCitations = 
               'Content-Type': 'application/json',
             },
           })
+          .then((response) => ({ fileId: file.file_id, data: response.data }))
           .catch((error) => {
             logAxiosError({
               message: 'Error encountered in `file_search` while querying file',
@@ -148,18 +160,7 @@ const createFileSearchTool = async ({ userId, files, entity_id, fileCitations = 
         return ['No results found or errors occurred while searching the files.', undefined];
       }
 
-      const formattedResults = validResults
-        .flatMap((result, fileIndex) =>
-          result.data.map(([docInfo, distance]) => ({
-            filename: docInfo.metadata.source.split('/').pop(),
-            content: docInfo.page_content,
-            distance,
-            file_id: files[fileIndex]?.file_id,
-            page: docInfo.metadata.page || null,
-          })),
-        )
-        .sort((a, b) => a.distance - b.distance)
-        .slice(0, 10);
+      const formattedResults = collectFileSearchResults(validResults, maxDistance);
 
       if (formattedResults.length === 0) {
         return [
@@ -180,6 +181,10 @@ const createFileSearchTool = async ({ userId, files, entity_id, fileCitations = 
       const sources = formattedResults.map((result) => ({
         type: 'file',
         fileId: result.file_id,
+        documentId: result.documentId,
+        chunkId: result.chunkId,
+        source: result.source,
+        distance: result.distance,
         content: result.content,
         fileName: result.filename,
         relevance: 1.0 - result.distance,
