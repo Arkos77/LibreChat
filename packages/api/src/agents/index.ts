@@ -35,6 +35,7 @@ export * from './plan';
 export * from './prewarm';
 export * from './ptc';
 export * from './openai';
+export * from './oracle';
 export * from './transactions';
 export * from './traversal';
 export * from './usage';

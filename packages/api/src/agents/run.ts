@@ -53,6 +53,7 @@ import type { ResolvedAlwaysApplySkill } from '~/agents/skills';
 import type { CodeExecutionContext } from '~/agents/execution';
 import type { MCPToolAlias } from '~/tools/classification';
 import type { SubagentUsageEvent } from '~/agents/usage';
+import type { OracleRunOptions } from '~/agents/oracle';
 import type { RunFadingTiers } from './fading';
 import type * as t from '~/types';
 import {
@@ -107,6 +108,7 @@ import { createStepBudgetHook } from '~/agents/stepBudget';
 import { buildHITLRunWiring } from '~/agents/hitl/runtime';
 import { buildLangfuseConfig } from '~/langfuse/config';
 import { applyTestRunHook } from '~/agents/testHook';
+import { attachRunOracle } from '~/agents/oracle';
 import { isUserProvided } from '~/utils/common';
 import { createSafeUser } from '~/utils/env';
 
@@ -1422,6 +1424,7 @@ export async function createRun({
   appConfig,
   subagentUsageSink,
   subagentTasks,
+  oracle,
   steering,
   activityLabel,
   activityPhase,
@@ -1500,6 +1503,8 @@ export async function createRun({
   subagentUsageSink?: (event: SubagentUsageEvent) => void;
   /** Host-owned detached-subagent task store and trusted parent-thread scope. */
   subagentTasks?: SubagentTaskConfig;
+  /** Host-supplied QA for a single producer; separate from task settlement and authorization. */
+  oracle?: OracleRunOptions;
   /**
    * The run-scoped steer-drain hook (a `PostToolBatch` callback built via
    * `createSteerDrainHook`). Registered on the run's hook registry independent
@@ -1560,6 +1565,12 @@ export async function createRun({
   RunConfig,
   'tokenCounter' | 'customHandlers' | 'indexTokenCountMap' | 'initialSessions'
 >): Promise<Run<IState>> {
+  if (
+    oracle &&
+    (agents.length !== 1 || agents[0].id !== oracle.agentId || agents[0].edges?.length)
+  ) {
+    throw new Error('Oracle requires one explicitly identified producer agent');
+  }
   /**
    * Only extract discovered tools if:
    * 1. We have message history to parse
@@ -2224,5 +2235,8 @@ export async function createRun({
     modelCallbacks,
     conversationId: conversationId ?? requestBody?.conversationId ?? undefined,
   });
+  if (oracle) {
+    attachRunOracle(run, oracle);
+  }
   return run;
 }
